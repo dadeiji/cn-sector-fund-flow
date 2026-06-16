@@ -151,6 +151,7 @@ class FundFlowCollector:
         if self.running:
             return
         self.running = True
+        self._cleanup()
 
         def _loop():
             while self.running:
@@ -166,6 +167,19 @@ class FundFlowCollector:
         self._thread = threading.Thread(target=_loop, daemon=True)
         self._thread.start()
         print(f"数据采集已启动（间隔 {interval}s）")
+
+    def _cleanup(self, keep_days: int = 30):
+        """清理超过 keep_days 天的历史数据文件。"""
+        cutoff = datetime.now() - timedelta(days=keep_days)
+        cutoff_str = cutoff.strftime("%Y%m%d")
+        removed = 0
+        for fp in self.save_dir.glob("fund_flow_*.json"):
+            date_str = fp.stem.replace("fund_flow_", "")
+            if date_str <= cutoff_str:
+                fp.unlink()
+                removed += 1
+        if removed:
+            print(f"已清理 {removed} 个过期数据文件（保留近 {keep_days} 天）")
 
     def stop(self):
         self.running = False
@@ -365,11 +379,14 @@ def main():
     parser.add_argument("--once", action="store_true", help="单次采集并生成图表")
     parser.add_argument("--collect", action="store_true", help="仅后台采集数据")
     parser.add_argument("--chart", action="store_true", help="仅从已有数据生成图表")
+    parser.add_argument("--cleanup", action="store_true", help="仅清理过期数据文件")
     parser.add_argument("--csv", type=str, help="从 CSV 文件加载数据生成图表")
     parser.add_argument("--live", action="store_true", help="采集 + HTTP 实时图表")
     parser.add_argument("--port", type=int, default=HTTP_PORT, help=f"HTTP 端口 (默认 {HTTP_PORT})")
     parser.add_argument("--interval", type=int, default=COLLECT_INTERVAL,
                         help=f"采集间隔秒数 (默认 {COLLECT_INTERVAL})")
+    parser.add_argument("--keep-days", type=int, default=30,
+                        help="数据保留天数 (默认 30)")
     parser.add_argument("--top", type=int, default=TOP_N, help=f"显示板块数 (默认 {TOP_N})")
     parser.add_argument("--mode", choices=["delta", "cumulative"], default="cumulative",
                         help="显示模式: cumulative=累计 (默认), delta=增量")
@@ -379,6 +396,10 @@ def main():
     args = parser.parse_args()
 
     collector = FundFlowCollector()
+
+    if args.cleanup:
+        collector._cleanup(keep_days=args.keep_days)
+        return
 
     if args.once:
         print("单次采集...")

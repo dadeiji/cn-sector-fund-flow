@@ -2,17 +2,15 @@
 
 ## Project
 
-Single-file Python app for real-time Chinese stock market concept sector fund flow visualization. Uses `akshare` to fetch data from 同花顺 (THS), generates interactive Plotly HTML charts.
+Single-file Python app for real-time Chinese stock market concept sector main force fund flow visualization. Uses 东方财富 API to fetch 主力资金 data, generates interactive Plotly HTML charts.
 
 ## Dependencies
 
-No build system or lockfile. Install manually:
-
 ```
-pip install akshare pandas plotly
+pip install -r requirements.txt
 ```
 
-Python 3.13+ confirmed working.
+Python 3.10+ required.
 
 ## Entrypoint
 
@@ -40,9 +38,9 @@ Trading: weekdays 9:30–15:00 CST. The collector auto-pauses outside these hour
 
 ## Architecture
 
-- `FundFlowCollector`: daemon thread that calls `ak.stock_fund_flow_concept(symbol="即时")` each interval, parses with `"行业"` and `"净额"` columns, persists to JSON lines.
-- `FundFlowChart`: reads JSON lines into DataFrame, selects top-N sectors by last tick, generates Plotly figure with annotations.
-- HTTP server (`_ChartHandler`): serves Plotly HTML with `meta refresh` for auto-reload in live mode.
+- `FundFlowCollector`: daemon thread that calls 东方财富 API (`data.eastmoney.com/dataapi/bkzj/getbkzj`) each interval, parses 主力净流入 (f62), persists to JSON lines. Auto-cleans data files older than 30 days on startup.
+- `FundFlowChart`: reads JSON lines into DataFrame, selects top-N sectors by last tick (filtered to sectors with ≥50% time coverage), generates Plotly figure with annotations. X-axis fixed to 9:30-15:00.
+- HTTP server (`_ChartHandler`): serves Plotly HTML with `meta refresh` for auto-reload in live mode. Supports `SO_REUSEADDR` for quick restart.
 
 ## Conventions
 
