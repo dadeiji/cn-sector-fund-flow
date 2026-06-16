@@ -54,6 +54,8 @@ def _wrap_html(plot_html: str, refresh_seconds: int = None) -> str:
     return HTML_TEMPLATE.format(refresh=refresh, plot_html=plot_html)
 MARKET_OPEN = dt_time(9, 30)
 MARKET_CLOSE = dt_time(15, 0)
+LUNCH_START = dt_time(11, 30)
+LUNCH_END = dt_time(13, 0)
 TOP_N = 10
 HTTP_PORT = 8899
 DATA_FILENAME = "fund_flow_{date}.json"
@@ -73,6 +75,36 @@ def is_trading_day() -> bool:
 def is_market_open() -> bool:
     now = datetime.now().time()
     return MARKET_OPEN <= now <= MARKET_CLOSE
+
+
+def is_lunch_break() -> bool:
+    """11:30-13:00 午休时段。"""
+    now = datetime.now().time()
+    return LUNCH_START <= now < LUNCH_END
+
+
+def is_collecting_hours() -> bool:
+    """采集时段：交易日 9:30-11:30 和 13:00-15:00。"""
+    if not is_trading_day():
+        return False
+    now = datetime.now().time()
+    morning = MARKET_OPEN <= now < LUNCH_START
+    afternoon = LUNCH_END <= now <= MARKET_CLOSE
+    return morning or afternoon
+
+
+def market_session() -> str:
+    """返回当前市场状态：trading / lunch / closed。"""
+    if not is_trading_day():
+        return "closed"
+    now = datetime.now().time()
+    if MARKET_OPEN <= now < LUNCH_START:
+        return "trading"
+    if LUNCH_START <= now < LUNCH_END:
+        return "lunch"
+    if LUNCH_END <= now <= MARKET_CLOSE:
+        return "trading"
+    return "closed"
 
 
 def fmt_value(v: float) -> str:
@@ -156,10 +188,12 @@ class FundFlowCollector:
         def _loop():
             while self.running:
                 try:
-                    if is_trading_day() and is_market_open():
+                    if is_collecting_hours():
                         self.snapshot()
                     else:
-                        print(f"\r[{datetime.now().strftime('%H:%M:%S')}] 非交易时间，等待中...", end="")
+                        session = market_session()
+                        label = {"lunch": "午休时段", "closed": "非交易时间"}.get(session, "非交易时间")
+                        print(f"\r[{datetime.now().strftime('%H:%M:%S')}] {label}，等待中...", end="")
                 except Exception as e:
                     print(f"\n采集错误: {e}")
                 time.sleep(interval)
@@ -206,13 +240,16 @@ class FundFlowChart:
         return df
 
     def generate(self, df: pd.DataFrame, mode: str = "delta",
-                 top_n: int = TOP_N, output: str = None, log_scale: bool = False) -> go.Figure:
+                 top_n: int = TOP_N, output: str = None, log_scale: bool = False,
+                 title_extra: str = "") -> go.Figure:
 
         value_col = "delta" if mode == "delta" else "main_net_inflow"
         y_label = "增量净流入（亿）" if mode == "delta" else "累计净流入（亿）"
         title_suffix = "· 增量" if mode == "delta" else "· 累计"
         if log_scale:
             title_suffix += " (对数)"
+        if title_extra:
+            title_suffix += f" · {title_extra}"
 
         last_tick = df["time"].max()
         min_records = df["time"].nunique() * 0.5  # 至少覆盖 50% 时间点
@@ -442,7 +479,13 @@ def main():
             if not fp.exists():
                 raise FileNotFoundError("暂无数据")
             df = chart.load_data(fp)
-            return chart.generate(df, mode=args.mode, top_n=args.top, log_scale=args.log)
+            session = market_session()
+            title_extra = {
+                "lunch": "上午半场总结",
+                "closed": "当日总结",
+            }.get(session, "")
+            return chart.generate(df, mode=args.mode, top_n=args.top,
+                                  log_scale=args.log, title_extra=title_extra)
 
         try:
             _start_http_server(gen_chart, port=args.port)
@@ -479,7 +522,13 @@ def main():
                 if fp.exists():
                     df = chart.load_data(fp)
                     html_path = str(CHART_DIR / "fund_flow.html")
-                    fig = chart.generate(df, mode=args.mode, top_n=args.top, log_scale=args.log)
+                    session = market_session()
+                    title_extra = {
+                        "lunch": "上午半场总结",
+                        "closed": "当日总结",
+                    }.get(session, "")
+                    fig = chart.generate(df, mode=args.mode, top_n=args.top,
+                                         log_scale=args.log, title_extra=title_extra)
                     plot_html = fig.to_html(include_plotlyjs="cdn", full_html=False, div_id="chart",
                                             config={"responsive": True, "displayModeBar": True})
                     Path(html_path).write_text(_wrap_html(plot_html), encoding="utf-8")
