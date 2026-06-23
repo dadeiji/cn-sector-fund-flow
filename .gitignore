@@ -44,3 +44,7 @@ memory_file_metadata.json
 .reme_store_v1
 *.weixin-migrate.bak
 agent.json
+
+# Runtime data files
+data/*.json
+fund_flow.py.bak
