@@ -317,6 +317,9 @@ class FundFlowChart:
                     df_top["time"].iloc[0].replace(hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute, second=0),
                     df_top["time"].iloc[0].replace(hour=MARKET_CLOSE.hour, minute=MARKET_CLOSE.minute, second=0),
                 ],
+                rangebreaks=[
+                    dict(bounds=[11.5, 13], pattern="hour"),
+                ],
                 tickfont=dict(size=11, color="#666"),
             ),
             yaxis=dict(
@@ -374,18 +377,14 @@ class FundFlowChart:
 
 class _ChartHandler(http.server.SimpleHTTPRequestHandler):
     chart_gen = None
+    refresh_seconds = 60
+    _cache = {"html": None, "data_mtime": 0}
+    _cache_lock = threading.Lock()
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             try:
-                fig = self.chart_gen()
-                plot_html = fig.to_html(
-                    include_plotlyjs="cdn",
-                    full_html=False,
-                    div_id="chart",
-                    config={"responsive": True, "displayModeBar": True},
-                )
-                html = _wrap_html(plot_html, refresh_seconds=COLLECT_INTERVAL)
+                html = self._get_cached_html()
                 self.send_response(200)
                 self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
@@ -394,19 +393,50 @@ class _ChartHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_response(500)
                 self.end_headers()
                 self.wfile.write(f"生成图表失败: {e}".encode())
+        elif self.path == "/api/health":
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
         else:
             super().do_GET()
 
+    def _get_cached_html(self):
+        today = datetime.now().strftime("%Y%m%d")
+        fp = DATA_DIR / DATA_FILENAME.format(date=today)
+        if not fp.exists():
+            raise FileNotFoundError("暂无数据")
+        mtime = fp.stat().st_mtime
+        with self._cache_lock:
+            if self._cache["html"] and self._cache["data_mtime"] == mtime:
+                return self._cache["html"]
+        fig = self.chart_gen()
+        plot_html = fig.to_html(
+            include_plotlyjs="cdn",
+            full_html=False,
+            div_id="chart",
+            config={"responsive": True, "displayModeBar": True},
+        )
+        html = _wrap_html(plot_html, refresh_seconds=self.refresh_seconds)
+        with self._cache_lock:
+            self._cache["html"] = html
+            self._cache["data_mtime"] = mtime
+        return html
 
-def _make_handler(chart_gen):
-    cls = type("Handler", (_ChartHandler,), {"chart_gen": staticmethod(chart_gen)})
+    def log_message(self, format, *args):
+        pass  # 静默日志，减少干扰
+
+
+def _make_handler(chart_gen, refresh_seconds=60):
+    cls = type("Handler", (_ChartHandler,), {"chart_gen": staticmethod(chart_gen), "refresh_seconds": refresh_seconds})
     return cls
 
 
-def _start_http_server(chart_gen, port: int = HTTP_PORT):
-    handler = _make_handler(chart_gen)
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("", port), handler) as httpd:
+def _start_http_server(chart_gen, port: int = HTTP_PORT, refresh_seconds: int = 60):
+    handler = _make_handler(chart_gen, refresh_seconds)
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    socketserver.ThreadingTCPServer.daemon_threads = True
+    with socketserver.ThreadingTCPServer(("", port), handler) as httpd:
         print(f"图表服务: http://localhost:{port}")
         httpd.serve_forever()
 
@@ -488,7 +518,7 @@ def main():
                                   log_scale=args.log, title_extra=title_extra)
 
         try:
-            _start_http_server(gen_chart, port=args.port)
+            _start_http_server(gen_chart, port=args.port, refresh_seconds=args.interval)
         except KeyboardInterrupt:
             collector.stop()
         return
