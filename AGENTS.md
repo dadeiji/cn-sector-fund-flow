@@ -2,7 +2,7 @@
 
 ## Project
 
-Single-file Python app for real-time Chinese stock market concept sector main force fund flow visualization. Uses 东方财富 API to fetch 主力资金 data, generates interactive Plotly HTML charts.
+Single-file Python app for real-time Chinese stock market concept sector main force fund flow visualization. Uses 东方财富 and 同花顺 APIs to fetch 主力资金 data, generates interactive Plotly HTML charts with dual-tab layout.
 
 ## Dependencies
 
@@ -10,7 +10,7 @@ Single-file Python app for real-time Chinese stock market concept sector main fo
 pip install -r requirements.txt
 ```
 
-Python 3.10+ required.
+Python 3.10+ required. `py_mini_racer` and `akshare` needed for 同花顺 API authentication (hexin-v).
 
 ## Entrypoint
 
@@ -18,19 +18,20 @@ Python 3.10+ required.
 
 | Command | Behavior |
 |---|---|
-| `python fund_flow.py` | Collect + periodic chart refresh (default) |
-| `python fund_flow.py --once` | One snapshot → open browser chart |
-| `python fund_flow.py --collect` | Background collection only |
-| `python fund_flow.py --chart` | Generate chart from existing data |
+| `python fund_flow.py` | Collect (东方财富 + 同花顺) + periodic chart refresh |
+| `python fund_flow.py --once` | One snapshot from both sources → open dual-tab chart |
+| `python fund_flow.py --collect` | Background collection only (both sources) |
+| `python fund_flow.py --chart` | Generate dual-tab chart from existing data |
 | `python fund_flow.py --chart --csv <file>` | Generate chart from CSV |
-| `python fund_flow.py --live` | Collect + HTTP server on port 8899 |
+| `python fund_flow.py --live` | Collect + HTTP server with dual-tab on port 8899 |
 
-Key flags: `--interval` (default 60s), `--top` (default 15), `--mode delta|cumulative`, `--port` (default 8899), `--timeout` (auto-exit).
+Key flags: `--interval` (default 60s), `--top` (default 10), `--mode delta|cumulative`, `--port` (default 8899), `--timeout` (auto-exit).
 
 ## Data & Output
 
-- `data/fund_flow_YYYYMMDD.json` — JSON lines, one object per tick per sector. Fields: `time`, `sector`, `main_net_inflow`, `delta`, `change_pct`, `index_value`.
-- `charts/fund_flow.html` — generated Plotly HTML chart (overwritten on each refresh).
+- `data/fund_flow_YYYYMMDD.json` — 东方财富 data, JSON lines. Fields: `time`, `sector`, `main_net_inflow`, `delta`, `change_pct`, `index_value`.
+- `data/ths_fund_flow_YYYYMMDD.json` — 同花顺 data (same format, top 20 sectors by net inflow).
+- `charts/fund_flow.html` — dual-tab Plotly chart (东方财富 tab + 同花顺 tab).
 
 ## Market Hours
 
@@ -38,9 +39,11 @@ Trading: weekdays 9:30–15:00 CST. The collector auto-pauses outside these hour
 
 ## Architecture
 
-- `FundFlowCollector`: daemon thread that calls 东方财富 API (`data.eastmoney.com/dataapi/bkzj/getbkzj`) each interval, parses 主力净流入 (f62), persists to JSON lines. Auto-cleans data files older than 30 days on startup.
-- `FundFlowChart`: reads JSON lines into DataFrame, selects top-N sectors by last tick (filtered to sectors with ≥50% time coverage), generates Plotly figure with annotations. X-axis fixed to 9:30-15:00.
-- HTTP server (`_ChartHandler`): serves Plotly HTML with `meta refresh` for auto-reload in live mode. Supports `SO_REUSEADDR` for quick restart.
+- `FundFlowCollector`: daemon thread calling 东方财富 API (`data.eastmoney.com/dataapi/bkzj/getbkzj`) each interval, parses 主力净流入 (f62), persists to JSON lines.
+- `THSFundFlowCollector`: daemon thread calling 同花顺 API (`data.10jqka.com.cn/funds/gnzjl/`) with `hexin-v` auth, returns top 20 sectors sorted by net inflow. Uses `py_mini_racer` + akshare's `ths.js` for auth token generation.
+- `FundFlowChart`: reads JSON lines into DataFrame, selects top-N sectors by last tick, generates Plotly figures. `_build_dual_html()` composes two charts into a tabbed HTML layout with JS tab switching and Plotly resize on switch.
+- HTTP server (`_ChartHandler`): serves dual-tab HTML with `meta refresh` for auto-reload in live mode.
+- Graceful degradation: if `py_mini_racer`/`akshare` not installed, 同花顺 collector is skipped, single-tab chart is generated.
 
 ## Conventions
 

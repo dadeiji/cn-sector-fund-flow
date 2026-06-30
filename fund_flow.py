@@ -3,11 +3,10 @@
 资金流向实时走势图
 实时采集板块资金流数据，绘制多板块资金净流入走势图。
 用法:
-  python fund_flow.py              # 实时采集+浏览器打开图表
+  python fund_flow.py              # 实时采集 + HTTP 实时图表（默认）
   python fund_flow.py --once       # 单次采集生成静态图表
   python fund_flow.py --collect    # 仅后台采集数据
   python fund_flow.py --chart      # 仅从已有数据生成图表
-  python fund_flow.py --live       # 采集 + HTTP 实时图表
 """
 
 import argparse
@@ -24,6 +23,13 @@ from pathlib import Path
 import requests
 import pandas as pd
 import plotly.graph_objects as go
+
+try:
+    import py_mini_racer
+    from akshare.stock_feature.stock_fund_flow import _get_file_content_ths
+    HAS_THS_AUTH = True
+except ImportError:
+    HAS_THS_AUTH = False
 
 DATA_DIR = Path(__file__).parent / "data"
 CHART_DIR = Path(__file__).parent / "charts"
@@ -48,10 +54,72 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", "Ping
 </body>
 </html>"""
 
+DUAL_TAB_TEMPLATE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+{refresh}
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+html, body {{ height: 100%; overflow: hidden; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", "PingFang SC", sans-serif; background: #f5f5f5; }}
+.tab-bar {{
+    display: flex; align-items: center; gap: 0;
+    background: #fff; border-bottom: 2px solid #e0e0e0;
+    padding: 0 16px; height: 44px; flex-shrink: 0;
+}}
+.tab-btn {{
+    padding: 8px 24px; font-size: 14px; font-weight: 600;
+    border: none; background: none; cursor: pointer;
+    color: #888; border-bottom: 3px solid transparent;
+    transition: all 0.2s; margin-bottom: -2px;
+}}
+.tab-btn:hover {{ color: #333; }}
+.tab-btn.active {{ color: #1a73e8; border-bottom-color: #1a73e8; }}
+.tab-badge {{
+    font-size: 11px; color: #999; margin-left: 4px; font-weight: 400;
+}}
+.tab-panel {{ display: none; width: 100%; height: calc(100vh - 44px); }}
+.tab-panel.active {{ display: block; }}
+.page-wrap {{ display: flex; flex-direction: column; height: 100vh; }}
+</style>
+<script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
+</head>
+<body>
+<div class="page-wrap">
+  <div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('em')">东方财富<span class="tab-badge">主力净流入</span></button>
+    <button class="tab-btn" onclick="switchTab('ths')">同花顺<span class="tab-badge">资金净额</span></button>
+  </div>
+  <div id="panel-em" class="tab-panel active">{em_chart}</div>
+  <div id="panel-ths" class="tab-panel">{ths_chart}</div>
+</div>
+<script>
+function switchTab(tab) {{
+    document.querySelectorAll('.tab-btn').forEach(function(btn, i) {{
+        btn.classList.toggle('active', (tab === 'em' && i === 0) || (tab === 'ths' && i === 1));
+    }});
+    document.getElementById('panel-em').classList.toggle('active', tab === 'em');
+    document.getElementById('panel-ths').classList.toggle('active', tab === 'ths');
+    // Trigger Plotly resize for the newly visible chart
+    var panel = document.getElementById('panel-' + tab);
+    var gd = panel.querySelector('.js-plotly-plot');
+    if (gd) {{ Plotly.Plots.resize(gd); }}
+}}
+</script>
+</body>
+</html>"""
+
 
 def _wrap_html(plot_html: str, refresh_seconds: int = None) -> str:
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
     return HTML_TEMPLATE.format(refresh=refresh, plot_html=plot_html)
+
+
+def _wrap_dual_html(em_chart: str, ths_chart: str, refresh_seconds: int = None) -> str:
+    refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
+    return DUAL_TAB_TEMPLATE.format(refresh=refresh, em_chart=em_chart, ths_chart=ths_chart)
 MARKET_OPEN = dt_time(9, 30)
 MARKET_CLOSE = dt_time(15, 0)
 LUNCH_START = dt_time(11, 30)
@@ -59,6 +127,7 @@ LUNCH_END = dt_time(13, 0)
 TOP_N = 10
 HTTP_PORT = 8899
 DATA_FILENAME = "fund_flow_{date}.json"
+THS_DATA_FILENAME = "ths_fund_flow_{date}.json"
 
 COLORS = [
     "#e74c3c", "#2ecc71", "#3498db", "#f39c12", "#9b59b6",
@@ -230,15 +299,142 @@ class FundFlowCollector:
         self.running = False
 
 
+class THSFundFlowCollector:
+    """基于同花顺 API 实时采集概念板块资金净流入排名数据。
+
+    按净额降序请求第 1 页（前 20 个板块），通过 hexin-v 认证头访问。
+    数据格式与 FundFlowCollector 一致，共用 FundFlowChart 生成图表。
+    """
+
+    THS_URL = "http://data.10jqka.com.cn/funds/gnzjl/field/je/order/desc/page/1/ajax/1/free/1/"
+
+    def __init__(self, save_dir: Path = DATA_DIR):
+        self.save_dir = save_dir
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.running = False
+        self._thread = None
+        self._prev_flow: dict[str, float] = {}
+        self._session = requests.Session()
+        self._session.trust_env = False
+
+    def _make_headers(self) -> dict:
+        js_code = py_mini_racer.MiniRacer()
+        js_content = _get_file_content_ths("ths.js")
+        js_code.eval(js_content)
+        v_code = js_code.call("v")
+        return {
+            "Accept": "text/html, */*; q=0.01",
+            "Accept-Encoding": "gzip, deflate",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "keep-alive",
+            "hexin-v": v_code,
+            "Host": "data.10jqka.com.cn",
+            "Pragma": "no-cache",
+            "Referer": "http://data.10jqka.com.cn/funds/gnzjl/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/90.0.4430.85 Safari/537.36",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+    def _fetch_raw(self) -> list[dict]:
+        import re as _re
+        headers = self._make_headers()
+        r = self._session.get(self.THS_URL, headers=headers, timeout=15)
+        r.encoding = "gbk"
+        match = _re.search(r'var JS_DATA = (\[.*?\]);', r.text)
+        if not match:
+            return []
+        return json.loads(match.group(1))
+
+    def _parse(self, raw: list[dict]) -> list[dict]:
+        now = datetime.now()
+        rows = []
+        for item in raw:
+            name = item.get("name", "")
+            amount = item.get("amount", 0)  # 已经是亿
+            prev = self._prev_flow.get(name)
+            delta = amount - prev if prev is not None else None
+            rows.append({
+                "time": now.strftime("%H:%M:%S"),
+                "sector": name,
+                "main_net_inflow": amount,
+                "delta": delta,
+                "change_pct": None,
+                "index_value": None,
+            })
+        self._prev_flow = {r["sector"]: r["main_net_inflow"] for r in rows}
+        return rows
+
+    def snapshot(self) -> list[dict]:
+        raw = self._fetch_raw()
+        rows = self._parse(raw)
+        self._persist(rows)
+        return rows
+
+    def _persist(self, rows: list[dict]):
+        today = datetime.now().strftime("%Y%m%d")
+        fp = self.save_dir / THS_DATA_FILENAME.format(date=today)
+        with open(fp, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    def start(self, interval: int = COLLECT_INTERVAL):
+        if self.running:
+            return
+        if not HAS_THS_AUTH:
+            print("同花顺采集需要 py_mini_racer 和 akshare，跳过")
+            return
+        self.running = True
+        self._cleanup()
+
+        def _loop():
+            while self.running:
+                try:
+                    if is_collecting_hours():
+                        self.snapshot()
+                    else:
+                        session = market_session()
+                        label = {"lunch": "午休时段", "closed": "非交易时间"}.get(session, "非交易时间")
+                        print(f"\r[{datetime.now().strftime('%H:%M:%S')}] [同花顺] {label}，等待中...", end="")
+                except Exception as e:
+                    print(f"\n[同花顺] 采集错误: {e}")
+                time.sleep(interval)
+
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+        print(f"[同花顺] 数据采集已启动（间隔 {interval}s）")
+
+    def _cleanup(self, keep_days: int = 30):
+        cutoff = datetime.now() - timedelta(days=keep_days)
+        cutoff_str = cutoff.strftime("%Y%m%d")
+        removed = 0
+        for fp in self.save_dir.glob("ths_fund_flow_*.json"):
+            date_str = fp.stem.replace("ths_fund_flow_", "")
+            if date_str <= cutoff_str:
+                fp.unlink()
+                removed += 1
+        if removed:
+            print(f"[同花顺] 已清理 {removed} 个过期数据文件（保留近 {keep_days} 天）")
+
+    def stop(self):
+        self.running = False
+
+
 class FundFlowChart:
 
-    def load_data(self, data_path: Path = None) -> pd.DataFrame:
+    def load_data(self, data_path: Path = None, source: str = "em") -> pd.DataFrame:
         if data_path is not None and data_path.suffix == ".csv":
             return pd.read_csv(data_path, parse_dates=["time"])
         today = datetime.now().strftime("%Y%m%d")
-        fp = (data_path or (DATA_DIR / DATA_FILENAME.format(date=today)))
+        if source == "ths":
+            pattern = "ths_fund_flow_*.json"
+            default_fp = DATA_DIR / THS_DATA_FILENAME.format(date=today)
+        else:
+            pattern = "fund_flow_*.json"
+            default_fp = DATA_DIR / DATA_FILENAME.format(date=today)
+        fp = data_path or default_fp
         if not fp.exists():
-            today_files = sorted(fp.parent.glob("fund_flow_*.json"))
+            today_files = sorted(fp.parent.glob(pattern))
             if not today_files:
                 raise FileNotFoundError(f"数据文件不存在: {fp}")
             dfs = [pd.read_json(f, lines=True) for f in today_files]
@@ -246,14 +442,18 @@ class FundFlowChart:
         else:
             df = pd.read_json(fp, lines=True)
         df["time"] = pd.to_datetime(df["time"], format="%H:%M:%S")
+        # 允许收盘后采集的数据（取 15:00 和实际最大时间的较大值）
         close_time = df["time"].iloc[0].replace(hour=MARKET_CLOSE.hour, minute=MARKET_CLOSE.minute, second=0)
-        df = df[df["time"] <= close_time]
+        max_time = df["time"].max()
+        cutoff = max(close_time, max_time)
+        df = df[df["time"] <= cutoff]
         return df
 
     def generate(self, df: pd.DataFrame, mode: str = "delta",
                  top_n: int = TOP_N, output: str = None, log_scale: bool = False,
-                 title_extra: str = "") -> go.Figure:
+                 title_extra: str = "", source: str = "em") -> go.Figure:
 
+        source_label = "同花顺" if source == "ths" else "东方财富"
         value_col = "delta" if mode == "delta" else "main_net_inflow"
         y_label = "增量净流入（亿）" if mode == "delta" else "累计净流入（亿）"
         title_suffix = "· 增量" if mode == "delta" else "· 累计"
@@ -277,6 +477,11 @@ class FundFlowChart:
         )
         df_top = df[df["sector"].isin(top_sectors)]
 
+        # 数据点少时用 markers+lines，多时纯 lines
+        time_points = df["time"].nunique()
+        scatter_mode = "lines+markers" if time_points <= 2 else "lines"
+        marker_size = 6 if time_points <= 2 else 0
+
         fig = go.Figure()
         for i, sector in enumerate(top_sectors):
             sub = df_top[df_top["sector"] == sector].sort_values("time")
@@ -284,9 +489,10 @@ class FundFlowChart:
             fig.add_trace(go.Scatter(
                 x=sub["time"],
                 y=sub[value_col],
-                mode="lines",
+                mode=scatter_mode,
                 name=sector,
                 line=dict(color=color, width=2),
+                marker=dict(color=color, size=marker_size) if marker_size else None,
                 hovertemplate=(
                     f"<b>{sector}</b><br>"
                     f"时间: %{{x|%H:%M:%S}}<br>"
@@ -311,7 +517,7 @@ class FundFlowChart:
 
         fig.update_layout(
             title=dict(
-                text=f"<b>概念板块主力资金流向走势图 {title_suffix}</b>",
+                text=f"<b>{source_label} · 概念板块主力资金流向走势图 {title_suffix}</b>",
                 font=dict(size=16, color="#333"),
                 x=0.01,
                 y=0.98,
@@ -385,9 +591,40 @@ class FundFlowChart:
         print(f"图表已保存: {html_path}")
         webbrowser.open(f"file://{html_path}")
 
+    def show_dual(self, em_df: pd.DataFrame, ths_df: pd.DataFrame,
+                  mode: str = "delta", top_n: int = TOP_N, log_scale: bool = False):
+        CHART_DIR.mkdir(parents=True, exist_ok=True)
+        html_path = CHART_DIR / "fund_flow.html"
+        html = self._build_dual_html(em_df, ths_df, mode=mode, top_n=top_n, log_scale=log_scale)
+        html_path.write_text(html, encoding="utf-8")
+        print(f"双 Tab 图表已保存: {html_path}")
+        webbrowser.open(f"file://{html_path}")
+
+    def _build_dual_html(self, em_df: pd.DataFrame = None, ths_df: pd.DataFrame = None,
+                         mode: str = "delta", top_n: int = TOP_N, log_scale: bool = False,
+                         refresh_seconds: int = None, title_extra: str = "") -> str:
+        plot_config = {"responsive": True, "displayModeBar": True}
+
+        em_chart = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;">暂无东方财富数据</div>'
+        ths_chart = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;">暂无同花顺数据</div>'
+
+        if em_df is not None and len(em_df) > 0:
+            em_fig = self.generate(em_df, mode=mode, top_n=top_n, log_scale=log_scale,
+                                   source="em", title_extra=title_extra)
+            em_chart = em_fig.to_html(include_plotlyjs=False, full_html=False,
+                                      div_id="chart-em", config=plot_config)
+
+        if ths_df is not None and len(ths_df) > 0:
+            ths_fig = self.generate(ths_df, mode=mode, top_n=top_n, log_scale=log_scale,
+                                    source="ths", title_extra=title_extra)
+            ths_chart = ths_fig.to_html(include_plotlyjs=False, full_html=False,
+                                        div_id="chart-ths", config=plot_config)
+
+        return _wrap_dual_html(em_chart, ths_chart, refresh_seconds=refresh_seconds)
+
 
 class _ChartHandler(http.server.SimpleHTTPRequestHandler):
-    chart_gen = None
+    html_gen = None
     refresh_seconds = 60
     _cache = {"html": None, "data_mtime": 0}
     _cache_lock = threading.Lock()
@@ -414,21 +651,18 @@ class _ChartHandler(http.server.SimpleHTTPRequestHandler):
 
     def _get_cached_html(self):
         today = datetime.now().strftime("%Y%m%d")
-        fp = DATA_DIR / DATA_FILENAME.format(date=today)
-        if not fp.exists():
+        em_fp = DATA_DIR / DATA_FILENAME.format(date=today)
+        ths_fp = DATA_DIR / THS_DATA_FILENAME.format(date=today)
+        mtime = max(
+            em_fp.stat().st_mtime if em_fp.exists() else 0,
+            ths_fp.stat().st_mtime if ths_fp.exists() else 0,
+        )
+        if mtime == 0:
             raise FileNotFoundError("暂无数据")
-        mtime = fp.stat().st_mtime
         with self._cache_lock:
             if self._cache["html"] and self._cache["data_mtime"] == mtime:
                 return self._cache["html"]
-        fig = self.chart_gen()
-        plot_html = fig.to_html(
-            include_plotlyjs="cdn",
-            full_html=False,
-            div_id="chart",
-            config={"responsive": True, "displayModeBar": True},
-        )
-        html = _wrap_html(plot_html, refresh_seconds=self.refresh_seconds)
+        html = self.html_gen()
         with self._cache_lock:
             self._cache["html"] = html
             self._cache["data_mtime"] = mtime
@@ -438,18 +672,26 @@ class _ChartHandler(http.server.SimpleHTTPRequestHandler):
         pass  # 静默日志，减少干扰
 
 
-def _make_handler(chart_gen, refresh_seconds=60):
-    cls = type("Handler", (_ChartHandler,), {"chart_gen": staticmethod(chart_gen), "refresh_seconds": refresh_seconds})
+def _make_handler(html_gen, refresh_seconds=60):
+    cls = type("Handler", (_ChartHandler,), {"html_gen": staticmethod(html_gen), "refresh_seconds": refresh_seconds})
     return cls
 
 
-def _start_http_server(chart_gen, port: int = HTTP_PORT, refresh_seconds: int = 60):
-    handler = _make_handler(chart_gen, refresh_seconds)
+def _start_http_server(html_gen, port: int = HTTP_PORT, refresh_seconds: int = 60):
+    handler = _make_handler(html_gen, refresh_seconds)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     socketserver.ThreadingTCPServer.daemon_threads = True
     with socketserver.ThreadingTCPServer(("", port), handler) as httpd:
         print(f"图表服务: http://localhost:{port}")
         httpd.serve_forever()
+
+
+def _load_today_data(chart: FundFlowChart, source: str = "em"):
+    """加载当日数据，不存在则返回 None。"""
+    try:
+        return chart.load_data(source=source)
+    except FileNotFoundError:
+        return None
 
 
 def main():
@@ -459,7 +701,7 @@ def main():
     parser.add_argument("--chart", action="store_true", help="仅从已有数据生成图表")
     parser.add_argument("--cleanup", action="store_true", help="仅清理过期数据文件")
     parser.add_argument("--csv", type=str, help="从 CSV 文件加载数据生成图表")
-    parser.add_argument("--live", action="store_true", help="采集 + HTTP 实时图表")
+    parser.add_argument("--live", action="store_true", help="（默认行为）采集 + HTTP 实时图表")
     parser.add_argument("--port", type=int, default=HTTP_PORT, help=f"HTTP 端口 (默认 {HTTP_PORT})")
     parser.add_argument("--interval", type=int, default=COLLECT_INTERVAL,
                         help=f"采集间隔秒数 (默认 {COLLECT_INTERVAL})")
@@ -474,118 +716,95 @@ def main():
     args = parser.parse_args()
 
     collector = FundFlowCollector()
+    ths_collector = THSFundFlowCollector() if HAS_THS_AUTH else None
 
     if args.cleanup:
         collector._cleanup(keep_days=args.keep_days)
+        if ths_collector:
+            ths_collector._cleanup(keep_days=args.keep_days)
         return
 
     if args.once:
         print("单次采集...")
         collector.snapshot()
-        today = datetime.now().strftime("%Y%m%d")
-        fp = DATA_DIR / DATA_FILENAME.format(date=today)
+        if ths_collector:
+            ths_collector.snapshot()
+
         chart = FundFlowChart()
-        df = chart.load_data(fp)
-        chart.show(df, mode=args.mode, top_n=args.top, log_scale=args.log)
+        em_df = _load_today_data(chart, source="em")
+        ths_df = _load_today_data(chart, source="ths") if ths_collector else None
+
+        if em_df is not None and ths_df is not None:
+            chart.show_dual(em_df, ths_df, mode=args.mode, top_n=args.top, log_scale=args.log)
+        elif em_df is not None:
+            chart.show(em_df, mode=args.mode, top_n=args.top, log_scale=args.log)
+        else:
+            print("无数据可显示")
         return
 
     if args.collect:
         print("后台采集模式，按 Ctrl+C 停止")
         collector.start(interval=args.interval)
+        if ths_collector:
+            ths_collector.start(interval=args.interval)
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
             collector.stop()
+            if ths_collector:
+                ths_collector.stop()
         return
 
     if args.chart:
         chart = FundFlowChart()
         try:
             data_path = Path(args.csv) if args.csv else None
-            df = chart.load_data(data_path)
-            chart.show(df, mode=args.mode, top_n=args.top, log_scale=args.log)
+            em_df = chart.load_data(data_path, source="em") if not args.csv else chart.load_data(data_path)
+            ths_df = _load_today_data(chart, source="ths") if not args.csv else None
+            if ths_df is not None:
+                chart.show_dual(em_df, ths_df, mode=args.mode, top_n=args.top, log_scale=args.log)
+            else:
+                chart.show(em_df, mode=args.mode, top_n=args.top, log_scale=args.log)
         except FileNotFoundError as e:
             print(e)
             sys.exit(1)
         return
 
-    if args.live:
-        collector.start(interval=args.interval)
-        chart = FundFlowChart()
-
-        def gen_chart():
-            today = datetime.now().strftime("%Y%m%d")
-            fp = DATA_DIR / DATA_FILENAME.format(date=today)
-            if not fp.exists():
-                raise FileNotFoundError("暂无数据")
-            df = chart.load_data(fp)
-            session = market_session()
-            title_extra = {
-                "lunch": "上午半场总结",
-                "closed": "当日总结",
-            }.get(session, "")
-            return chart.generate(df, mode=args.mode, top_n=args.top,
-                                  log_scale=args.log, title_extra=title_extra)
-
-        try:
-            _start_http_server(gen_chart, port=args.port, refresh_seconds=args.interval)
-        except KeyboardInterrupt:
-            collector.stop()
-        return
+    # 默认模式：实时采集 + HTTP 服务
+    collector.start(interval=args.interval)
+    if ths_collector:
+        ths_collector.start(interval=args.interval)
+    chart = FundFlowChart()
 
     print("=" * 60)
-    print("  资金流向实时走势图")
+    print("  资金流向实时走势图（东方财富 + 同花顺）")
+    print(f"  累计模式 · 前 {args.top} 板块 · {args.interval}s 采集")
+    print(f"  图表服务: http://localhost:{args.port}")
     print("  Ctrl+C 停止")
     print("=" * 60)
 
-    collector.start(interval=args.interval)
-    print("等待首次数据采集...")
-    time.sleep(3)
-    print("首次采集完成，打开图表...\n")
-
-    chart = FundFlowChart()
-
-    if args.timeout > 0:
-        print(f"将运行 {args.timeout} 秒后自动退出")
-
-    start_time = time.time()
+    def gen_html():
+        session = market_session()
+        title_extra = {
+            "lunch": "上午半场总结",
+            "closed": "当日总结",
+        }.get(session, "")
+        em_df = _load_today_data(chart, source="em")
+        ths_df = _load_today_data(chart, source="ths") if ths_collector else None
+        if em_df is None and ths_df is None:
+            raise FileNotFoundError("暂无数据")
+        return chart._build_dual_html(em_df, ths_df, mode=args.mode, top_n=args.top,
+                                       log_scale=args.log, refresh_seconds=args.interval,
+                                       title_extra=title_extra)
 
     try:
-        while True:
-            if args.timeout > 0 and (time.time() - start_time) > args.timeout:
-                print("\n达到设定时长，退出")
-                break
-
-            try:
-                today = datetime.now().strftime("%Y%m%d")
-                fp = DATA_DIR / DATA_FILENAME.format(date=today)
-                if fp.exists():
-                    df = chart.load_data(fp)
-                    html_path = str(CHART_DIR / "fund_flow.html")
-                    session = market_session()
-                    title_extra = {
-                        "lunch": "上午半场总结",
-                        "closed": "当日总结",
-                    }.get(session, "")
-                    fig = chart.generate(df, mode=args.mode, top_n=args.top,
-                                         log_scale=args.log, title_extra=title_extra)
-                    plot_html = fig.to_html(include_plotlyjs="cdn", full_html=False, div_id="chart",
-                                            config={"responsive": True, "displayModeBar": True})
-                    Path(html_path).write_text(_wrap_html(plot_html), encoding="utf-8")
-                    if len(df) > 0:
-                        latest = df["time"].max()
-                        sectors = len(df["sector"].unique())
-                        print(f"\r图表已更新 [{latest.strftime('%H:%M:%S')}] 已追踪 {sectors} 个板块", end="")
-            except Exception as e:
-                print(f"\n刷新图表出错: {e}")
-
-            time.sleep(args.interval)
+        _start_http_server(gen_html, port=args.port, refresh_seconds=args.interval)
     except KeyboardInterrupt:
-        pass
-    finally:
         collector.stop()
-        print("\n已退出")
+        if ths_collector:
+            ths_collector.stop()
+    print("\n已退出")
 
 
 if __name__ == "__main__":
