@@ -151,6 +151,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", "PingF
     display: flex; align-items: center; justify-content: center;
     height: 100%; color: #999; font-size: 14px;
 }
+.date-picker {
+    margin-left: auto; display: flex; align-items: center; gap: 6px;
+}
+.date-picker label { font-size: 12px; color: #888; }
+.date-picker input[type=date] {
+    padding: 4px 8px; font-size: 13px; border: 1px solid #ddd;
+    border-radius: 4px; font-family: inherit; color: #333;
+}
+.date-picker button {
+    padding: 4px 10px; font-size: 12px; border: 1px solid #ddd;
+    border-radius: 4px; background: #fff; cursor: pointer; color: #555;
+}
+.date-picker button:hover { background: #f0f0f0; }
 </style>
 <script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
 </head>
@@ -165,6 +178,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", "PingF
       同花顺<span class="tab-badge">资金净额</span>
       <span class="status-dot loading" id="dot-ths"></span>
     </button>
+    <div class="date-picker">
+      <label>日期</label>
+      <input type="date" id="date-picker" />
+      <button onclick="jumpToToday()">今日</button>
+    </div>
   </div>
   <div id="panel-em" class="tab-panel active"><div id="chart-em" class="chart-box"><div class="loading-msg">加载中...</div></div></div>
   <div id="panel-ths" class="tab-panel"><div id="chart-ths" class="chart-box"><div class="loading-msg">加载中...</div></div></div>
@@ -175,6 +193,7 @@ const COLORS = __COLORS_JSON__;
 const OUTFLOW_COLORS = __OUTFLOW_JSON__;
 let activeTab = 'em';
 let charts = { em: null, ths: null };
+let selectedDate = null;  // null=今日，否则 YYYY-MM-DD
 
 function switchTab(tab) {
     activeTab = tab;
@@ -304,7 +323,8 @@ function renderChart(source, data) {
 
 async function fetchData() {
     try {
-        var resp = await fetch('/api/data');
+        var url = '/api/data' + (selectedDate ? ('?date=' + selectedDate) : '');
+        var resp = await fetch(url);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         var json = await resp.json();
         if (json.em) renderChart('em', json.em);
@@ -318,7 +338,46 @@ async function fetchData() {
     }
 }
 
-// 启动轮询
+function todayStr() {
+    var d = new Date();
+    return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+
+function resetCharts() {
+    charts = { em: null, ths: null };
+}
+
+function onDateChange() {
+    var val = document.getElementById('date-picker').value;
+    selectedDate = (val === todayStr()) ? null : val;
+    resetCharts();
+    fetchData();
+}
+
+function jumpToToday() {
+    document.getElementById('date-picker').value = todayStr();
+    selectedDate = null;
+    resetCharts();
+    fetchData();
+}
+
+// 初始化日期选择器：默认今日，并加载可选日期范围
+function initDatePicker() {
+    var picker = document.getElementById('date-picker');
+    picker.value = todayStr();
+    picker.addEventListener('change', onDateChange);
+    fetch('/api/dates').then(function(r) { return r.json(); }).then(function(d) {
+        var all = (d.em || []).concat(d.ths || []);
+        if (all.length) {
+            all.sort();
+            picker.min = all[0];
+            picker.max = todayStr();
+        }
+    }).catch(function(){});
+}
+
+// 启动
+initDatePicker();
 fetchData();
 setInterval(fetchData, POLL_INTERVAL);
 </script>
@@ -661,25 +720,35 @@ class THSFundFlowCollector:
 
 class FundFlowChart:
 
-    def load_data(self, data_path: Path = None, source: str = "em") -> pd.DataFrame:
+    def load_data(self, data_path: Path = None, source: str = "em",
+                  date: str = None) -> pd.DataFrame:
         if data_path is not None and data_path.suffix == ".csv":
             return pd.read_csv(data_path, parse_dates=["time"])
         today = datetime.now().strftime("%Y%m%d")
         if source == "ths":
             pattern = "ths_fund_flow_*.json"
-            default_fp = DATA_DIR / THS_DATA_FILENAME.format(date=today)
+            name_tmpl = THS_DATA_FILENAME
         else:
             pattern = "fund_flow_*.json"
-            default_fp = DATA_DIR / DATA_FILENAME.format(date=today)
-        fp = data_path or default_fp
-        if not fp.exists():
-            today_files = sorted(fp.parent.glob(pattern))
-            if not today_files:
+            name_tmpl = DATA_FILENAME
+
+        if date:
+            # 指定日期：只加载该天文件，不存在则报错
+            fp = DATA_DIR / name_tmpl.format(date=date)
+            if not fp.exists():
                 raise FileNotFoundError(f"数据文件不存在: {fp}")
-            dfs = [pd.read_json(f, lines=True) for f in today_files]
-            df = pd.concat(dfs, ignore_index=True)
-        else:
             df = pd.read_json(fp, lines=True)
+        else:
+            default_fp = DATA_DIR / name_tmpl.format(date=today)
+            fp = data_path or default_fp
+            if not fp.exists():
+                today_files = sorted(fp.parent.glob(pattern))
+                if not today_files:
+                    raise FileNotFoundError(f"数据文件不存在: {fp}")
+                dfs = [pd.read_json(f, lines=True) for f in today_files]
+                df = pd.concat(dfs, ignore_index=True)
+            else:
+                df = pd.read_json(fp, lines=True)
         df["time"] = pd.to_datetime(df["time"], format="%H:%M:%S")
         # 允许收盘后采集的数据（取 15:00 和实际最大时间的较大值）
         close_time = df["time"].iloc[0].replace(hour=MARKET_CLOSE.hour, minute=MARKET_CLOSE.minute, second=0)
@@ -687,6 +756,17 @@ class FundFlowChart:
         cutoff = max(close_time, max_time)
         df = df[df["time"] <= cutoff]
         return df
+
+    def available_dates(self, source: str = "em") -> list[str]:
+        """返回该数据源有数据文件的日期列表（降序）。"""
+        pattern = "ths_fund_flow_*.json" if source == "ths" else "fund_flow_*.json"
+        prefix = "ths_fund_flow_" if source == "ths" else "fund_flow_"
+        dates = []
+        for fp in DATA_DIR.glob(pattern):
+            date_str = fp.stem.replace(prefix, "")
+            if len(date_str) == 8 and date_str.isdigit():
+                dates.append(f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}")
+        return sorted(set(dates), reverse=True)
 
     def generate(self, df: pd.DataFrame, mode: str = "delta",
                  top_n: int = TOP_N, bottom_n: int = BOTTOM_N,
@@ -984,14 +1064,20 @@ class FundFlowChart:
 
 
 class _ChartHandler(http.server.SimpleHTTPRequestHandler):
-    data_gen = None       # 返回 dict 的回调
+    data_gen = None       # 返回 dict 的回调，签名 data_gen(date=None)
+    dates_gen = None      # 返回可用日期列表的回调
     ajax_html = ""        # AJAX 模板 HTML
     refresh_seconds = 60
-    _cache = {"json": None, "data_mtime": 0}
+    _cache = {}           # {date_str: {"json":..., "mtime":...}}
     _cache_lock = threading.Lock()
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        if path in ("/", "/index.html"):
             # 返回 AJAX 模板（静态 HTML，数据由 JS 轮询获取）
             self.send_response(200)
             self.send_header("Content-type", "text/html; charset=utf-8")
@@ -999,9 +1085,11 @@ class _ChartHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(self.ajax_html.encode("utf-8"))
 
-        elif self.path == "/api/data":
+        elif path == "/api/data":
+            # date 参数：YYYY-MM-DD 或 YYYYMMDD，缺省为当日
+            date = self._normalize_date(query.get("date", [None])[0])
             try:
-                data = self._get_cached_data()
+                data = self._get_cached_data(date)
                 body = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-type", "application/json; charset=utf-8")
@@ -1015,7 +1103,22 @@ class _ChartHandler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
 
-        elif self.path == "/api/health":
+        elif path == "/api/dates":
+            try:
+                dates = self.dates_gen()
+                body = json.dumps(dates, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+
+        elif path == "/api/health":
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
@@ -1023,32 +1126,44 @@ class _ChartHandler(http.server.SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
-    def _get_cached_data(self):
-        today = datetime.now().strftime("%Y%m%d")
-        em_fp = DATA_DIR / DATA_FILENAME.format(date=today)
-        ths_fp = DATA_DIR / THS_DATA_FILENAME.format(date=today)
-        mtime = max(
-            em_fp.stat().st_mtime if em_fp.exists() else 0,
-            ths_fp.stat().st_mtime if ths_fp.exists() else 0,
-        )
+    @staticmethod
+    def _normalize_date(date_str):
+        """将 YYYY-MM-DD 转为 YYYYMMDD；None/空 返回 None（当日）。"""
+        if not date_str:
+            return None
+        return date_str.replace("-", "")
+
+    def _get_cached_data(self, date):
+        date_key = date or datetime.now().strftime("%Y%m%d")
+        mtime = self._data_mtime(date_key)
         if mtime == 0:
             raise FileNotFoundError("暂无数据")
         with self._cache_lock:
-            if self._cache["json"] and self._cache["data_mtime"] == mtime:
-                return self._cache["json"]
-        data = self.data_gen()
+            entry = self._cache.get(date_key)
+            if entry and entry["mtime"] == mtime:
+                return entry["json"]
+        data = self.data_gen(date)
         with self._cache_lock:
-            self._cache["json"] = data
-            self._cache["data_mtime"] = mtime
+            self._cache[date_key] = {"json": data, "mtime": mtime}
         return data
+
+    @staticmethod
+    def _data_mtime(date_str):
+        em_fp = DATA_DIR / DATA_FILENAME.format(date=date_str)
+        ths_fp = DATA_DIR / THS_DATA_FILENAME.format(date=date_str)
+        return max(
+            em_fp.stat().st_mtime if em_fp.exists() else 0,
+            ths_fp.stat().st_mtime if ths_fp.exists() else 0,
+        )
 
     def log_message(self, format, *args):
         pass  # 静默日志，减少干扰
 
 
-def _make_handler(data_gen, ajax_html, refresh_seconds=60):
+def _make_handler(data_gen, dates_gen, ajax_html, refresh_seconds=60):
     cls = type("Handler", (_ChartHandler,), {
         "data_gen": staticmethod(data_gen),
+        "dates_gen": staticmethod(dates_gen),
         "ajax_html": ajax_html,
         "refresh_seconds": refresh_seconds,
     })
@@ -1065,9 +1180,9 @@ def _build_ajax_html(refresh_seconds: int = 60) -> str:
     )
 
 
-def _start_http_server(data_gen, port: int = HTTP_PORT, refresh_seconds: int = 60):
+def _start_http_server(data_gen, dates_gen, port: int = HTTP_PORT, refresh_seconds: int = 60):
     ajax_html = _build_ajax_html(refresh_seconds)
-    handler = _make_handler(data_gen, ajax_html, refresh_seconds)
+    handler = _make_handler(data_gen, dates_gen, ajax_html, refresh_seconds)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     socketserver.ThreadingTCPServer.daemon_threads = True
     with socketserver.ThreadingTCPServer(("", port), handler) as httpd:
@@ -1075,10 +1190,10 @@ def _start_http_server(data_gen, port: int = HTTP_PORT, refresh_seconds: int = 6
         httpd.serve_forever()
 
 
-def _load_today_data(chart: FundFlowChart, source: str = "em"):
-    """加载当日数据，不存在则返回 None。"""
+def _load_data(chart: FundFlowChart, source: str = "em", date: str = None):
+    """加载数据，不存在则返回 None。date 格式 YYYYMMDD，None 表示当日/最新。"""
     try:
-        return chart.load_data(source=source)
+        return chart.load_data(source=source, date=date)
     except FileNotFoundError:
         return None
 
@@ -1121,8 +1236,8 @@ def main():
             ths_collector.snapshot()
 
         chart = FundFlowChart()
-        em_df = _load_today_data(chart, source="em")
-        ths_df = _load_today_data(chart, source="ths") if ths_collector else None
+        em_df = _load_data(chart, source="em")
+        ths_df = _load_data(chart, source="ths")
 
         if em_df is not None and ths_df is not None:
             chart.show_dual(em_df, ths_df, mode=args.mode, top_n=args.top,
@@ -1153,7 +1268,7 @@ def main():
         try:
             data_path = Path(args.csv) if args.csv else None
             em_df = chart.load_data(data_path, source="em") if not args.csv else chart.load_data(data_path)
-            ths_df = _load_today_data(chart, source="ths") if not args.csv else None
+            ths_df = _load_data(chart, source="ths") if not args.csv else None
             if ths_df is not None:
                 chart.show_dual(em_df, ths_df, mode=args.mode, top_n=args.top,
                                 bottom_n=args.bottom, log_scale=args.log)
@@ -1178,14 +1293,14 @@ def main():
     print("  Ctrl+C 停止")
     print("=" * 60)
 
-    def gen_data():
+    def gen_data(date=None):
         session = market_session()
         title_extra = {
             "lunch": "上午半场总结",
             "closed": "当日总结",
         }.get(session, "")
-        em_df = _load_today_data(chart, source="em")
-        ths_df = _load_today_data(chart, source="ths") if ths_collector else None
+        em_df = _load_data(chart, source="em", date=date)
+        ths_df = _load_data(chart, source="ths", date=date)
         if em_df is None and ths_df is None:
             raise FileNotFoundError("暂无数据")
         result = {}
@@ -1199,8 +1314,13 @@ def main():
                                                 title_extra=title_extra, source="ths")
         return result
 
+    def gen_dates():
+        em_dates = chart.available_dates(source="em")
+        ths_dates = chart.available_dates(source="ths")
+        return {"em": em_dates, "ths": ths_dates}
+
     try:
-        _start_http_server(gen_data, port=args.port, refresh_seconds=args.interval)
+        _start_http_server(gen_data, gen_dates, port=args.port, refresh_seconds=args.interval)
     except KeyboardInterrupt:
         collector.stop()
         if ths_collector:
