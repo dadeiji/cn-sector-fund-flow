@@ -477,10 +477,9 @@ class FundFlowChart:
         )
         df_top = df[df["sector"].isin(top_sectors)]
 
-        # 数据点少时用 markers+lines，多时纯 lines
+        # 始终显示 markers 保证 hover 可触发，数据多时用较小标记
         time_points = df["time"].nunique()
-        scatter_mode = "lines+markers" if time_points <= 2 else "lines"
-        marker_size = 6 if time_points <= 2 else 0
+        marker_size = 6 if time_points <= 3 else 3
 
         fig = go.Figure()
         for i, sector in enumerate(top_sectors):
@@ -489,21 +488,23 @@ class FundFlowChart:
             fig.add_trace(go.Scatter(
                 x=sub["time"],
                 y=sub[value_col],
-                mode=scatter_mode,
+                mode="lines+markers",
                 name=sector,
                 line=dict(color=color, width=2),
-                marker=dict(color=color, size=marker_size) if marker_size else None,
+                marker=dict(color=color, size=marker_size),
                 hovertemplate=(
                     f"<b>{sector}</b><br>"
                     f"时间: %{{x|%H:%M:%S}}<br>"
                     f"{y_label}: %{{y:.2f}}亿<extra></extra>"
                 ),
+                hoverlabel=dict(namelength=-1, font_size=13),
             ))
             last_row = sub.iloc[-1]
-            label_x = last_row["time"] + timedelta(seconds=30)
             fig.add_annotation(
-                x=label_x,
+                x=1.01,
                 y=last_row[value_col],
+                xref="paper",
+                yref="y",
                 text=f"<b>{sector}</b> {fmt_value(last_row[value_col])}",
                 showarrow=False,
                 xanchor="left",
