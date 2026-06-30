@@ -125,6 +125,7 @@ MARKET_CLOSE = dt_time(15, 0)
 LUNCH_START = dt_time(11, 30)
 LUNCH_END = dt_time(13, 0)
 TOP_N = 10
+BOTTOM_N = 5  # 净流出前5名
 HTTP_PORT = 8899
 DATA_FILENAME = "fund_flow_{date}.json"
 THS_DATA_FILENAME = "ths_fund_flow_{date}.json"
@@ -134,6 +135,10 @@ COLORS = [
     "#1abc9c", "#e67e22", "#34495e", "#c0392b", "#16a085",
     "#2980b9", "#8e44ad", "#27ae60", "#d35400", "#2c3e50",
     "#e91e63", "#00bcd4", "#ff5722", "#795548", "#607d8b",
+]
+# 净流出板块配色（偏冷/暗色调，与净流入区分）
+OUTFLOW_COLORS = [
+    "#546e7a", "#78909c", "#90a4ae", "#b0bec5", "#455a64",
 ]
 
 
@@ -302,11 +307,13 @@ class FundFlowCollector:
 class THSFundFlowCollector:
     """基于同花顺 API 实时采集概念板块资金净流入排名数据。
 
-    按净额降序请求第 1 页（前 20 个板块），通过 hexin-v 认证头访问。
-    数据格式与 FundFlowCollector 一致，共用 FundFlowChart 生成图表。
+    同时请求降序（净流入前20）和升序（净流出前20）两页数据，
+    通过 hexin-v 认证头访问。数据格式与 FundFlowCollector 一致，
+    共用 FundFlowChart 生成图表。
     """
 
-    THS_URL = "http://data.10jqka.com.cn/funds/gnzjl/field/je/order/desc/page/1/ajax/1/free/1/"
+    THS_URL_DESC = "http://data.10jqka.com.cn/funds/gnzjl/field/je/order/desc/page/1/ajax/1/free/1/"
+    THS_URL_ASC = "http://data.10jqka.com.cn/funds/gnzjl/field/je/order/asc/page/1/ajax/1/free/1/"
 
     def __init__(self, save_dir: Path = DATA_DIR):
         self.save_dir = save_dir
@@ -339,12 +346,27 @@ class THSFundFlowCollector:
     def _fetch_raw(self) -> list[dict]:
         import re as _re
         headers = self._make_headers()
-        r = self._session.get(self.THS_URL, headers=headers, timeout=15)
-        r.encoding = "gbk"
-        match = _re.search(r'var JS_DATA = (\[.*?\]);', r.text)
-        if not match:
-            return []
-        return json.loads(match.group(1))
+
+        results = []
+        seen_names = set()
+
+        for url in (self.THS_URL_DESC, self.THS_URL_ASC):
+            try:
+                r = self._session.get(url, headers=headers, timeout=15)
+                r.encoding = "gbk"
+                match = _re.search(r'var JS_DATA = (\[.*?\]);', r.text)
+                if match:
+                    items = json.loads(match.group(1))
+                    for item in items:
+                        name = item.get("name", "")
+                        if name and name not in seen_names:
+                            seen_names.add(name)
+                            results.append(item)
+            except Exception as e:
+                print(f"同花顺请求失败 ({url}): {e}")
+                continue
+
+        return results
 
     def _parse(self, raw: list[dict]) -> list[dict]:
         now = datetime.now()
@@ -450,7 +472,8 @@ class FundFlowChart:
         return df
 
     def generate(self, df: pd.DataFrame, mode: str = "delta",
-                 top_n: int = TOP_N, output: str = None, log_scale: bool = False,
+                 top_n: int = TOP_N, bottom_n: int = BOTTOM_N,
+                 output: str = None, log_scale: bool = False,
                  title_extra: str = "", source: str = "em") -> go.Figure:
 
         source_label = "同花顺" if source == "ths" else "东方财富"
@@ -468,20 +491,25 @@ class FundFlowChart:
         valid_sectors = sector_counts[sector_counts >= min_records].index
 
         last_slice = df[(df["time"] == last_tick) & (df["sector"].isin(valid_sectors))]
-        top_sectors = (
-            last_slice.groupby("sector")["main_net_inflow"]
-            .last()
-            .sort_values(ascending=False)
-            .head(top_n)
-            .index.tolist()
-        )
-        df_top = df[df["sector"].isin(top_sectors)]
+        ranking = last_slice.groupby("sector")["main_net_inflow"].last().sort_values(ascending=False)
+
+        # 净流入前 N 名
+        top_sectors = ranking.head(top_n).index.tolist()
+        # 净流出前 N 名（排名末尾，负值）
+        bottom_sectors = ranking.tail(bottom_n).index.tolist() if bottom_n > 0 else []
+        # 去重（防止板块极少时重叠）
+        bottom_sectors = [s for s in bottom_sectors if s not in top_sectors]
+        all_sectors = top_sectors + bottom_sectors
+
+        df_top = df[df["sector"].isin(all_sectors)]
 
         # 始终显示 markers 保证 hover 可触发，数据多时用较小标记
         time_points = df["time"].nunique()
         marker_size = 6 if time_points <= 3 else 3
 
         fig = go.Figure()
+
+        # --- 净流入板块（实线） ---
         for i, sector in enumerate(top_sectors):
             sub = df_top[df_top["sector"] == sector].sort_values("time")
             color = COLORS[i % len(COLORS)]
@@ -510,6 +538,41 @@ class FundFlowChart:
                 xanchor="left",
                 yanchor="middle",
                 font=dict(color=color, size=12, family="Microsoft YaHei, SimHei, sans-serif"),
+                bgcolor="rgba(255,255,255,0.95)",
+                bordercolor=color,
+                borderwidth=1.5,
+                borderpad=3,
+            )
+
+        # --- 净流出板块（虚线，灰冷色调） ---
+        for i, sector in enumerate(bottom_sectors):
+            sub = df_top[df_top["sector"] == sector].sort_values("time")
+            color = OUTFLOW_COLORS[i % len(OUTFLOW_COLORS)]
+            fig.add_trace(go.Scatter(
+                x=sub["time"],
+                y=sub[value_col],
+                mode="lines+markers",
+                name=sector,
+                line=dict(color=color, width=2),
+                marker=dict(color=color, size=marker_size, symbol="diamond"),
+                hovertemplate=(
+                    f"<b>{sector}</b><br>"
+                    f"时间: %{{x|%H:%M:%S}}<br>"
+                    f"{y_label}: %{{y:.2f}}亿<extra></extra>"
+                ),
+                hoverlabel=dict(namelength=-1, font_size=13),
+            ))
+            last_row = sub.iloc[-1]
+            fig.add_annotation(
+                x=1.01,
+                y=last_row[value_col],
+                xref="paper",
+                yref="y",
+                text=f"<b>{sector}</b> {fmt_value(last_row[value_col])}",
+                showarrow=False,
+                xanchor="left",
+                yanchor="middle",
+                font=dict(color=color, size=11, family="Microsoft YaHei, SimHei, sans-serif"),
                 bgcolor="rgba(255,255,255,0.95)",
                 bordercolor=color,
                 borderwidth=1.5,
@@ -582,10 +645,11 @@ class FundFlowChart:
             print(f"图表已保存: {output}")
         return fig
 
-    def show(self, df: pd.DataFrame, mode: str = "delta", top_n: int = TOP_N, log_scale: bool = False):
+    def show(self, df: pd.DataFrame, mode: str = "delta", top_n: int = TOP_N,
+             bottom_n: int = BOTTOM_N, log_scale: bool = False):
         CHART_DIR.mkdir(parents=True, exist_ok=True)
         html_path = CHART_DIR / "fund_flow.html"
-        fig = self.generate(df, mode=mode, top_n=top_n, log_scale=log_scale)
+        fig = self.generate(df, mode=mode, top_n=top_n, bottom_n=bottom_n, log_scale=log_scale)
         plot_html = fig.to_html(include_plotlyjs=False, full_html=False, div_id="chart",
                                 config={"responsive": True, "displayModeBar": True})
         html_path.write_text(_wrap_html(plot_html), encoding="utf-8")
@@ -593,16 +657,19 @@ class FundFlowChart:
         webbrowser.open(f"file://{html_path}")
 
     def show_dual(self, em_df: pd.DataFrame, ths_df: pd.DataFrame,
-                  mode: str = "delta", top_n: int = TOP_N, log_scale: bool = False):
+                  mode: str = "delta", top_n: int = TOP_N, bottom_n: int = BOTTOM_N,
+                  log_scale: bool = False):
         CHART_DIR.mkdir(parents=True, exist_ok=True)
         html_path = CHART_DIR / "fund_flow.html"
-        html = self._build_dual_html(em_df, ths_df, mode=mode, top_n=top_n, log_scale=log_scale)
+        html = self._build_dual_html(em_df, ths_df, mode=mode, top_n=top_n,
+                                     bottom_n=bottom_n, log_scale=log_scale)
         html_path.write_text(html, encoding="utf-8")
         print(f"双 Tab 图表已保存: {html_path}")
         webbrowser.open(f"file://{html_path}")
 
     def _build_dual_html(self, em_df: pd.DataFrame = None, ths_df: pd.DataFrame = None,
-                         mode: str = "delta", top_n: int = TOP_N, log_scale: bool = False,
+                         mode: str = "delta", top_n: int = TOP_N, bottom_n: int = BOTTOM_N,
+                         log_scale: bool = False,
                          refresh_seconds: int = None, title_extra: str = "") -> str:
         plot_config = {"responsive": True, "displayModeBar": True}
 
@@ -610,14 +677,14 @@ class FundFlowChart:
         ths_chart = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;">暂无同花顺数据</div>'
 
         if em_df is not None and len(em_df) > 0:
-            em_fig = self.generate(em_df, mode=mode, top_n=top_n, log_scale=log_scale,
-                                   source="em", title_extra=title_extra)
+            em_fig = self.generate(em_df, mode=mode, top_n=top_n, bottom_n=bottom_n,
+                                   log_scale=log_scale, source="em", title_extra=title_extra)
             em_chart = em_fig.to_html(include_plotlyjs=False, full_html=False,
                                       div_id="chart-em", config=plot_config)
 
         if ths_df is not None and len(ths_df) > 0:
-            ths_fig = self.generate(ths_df, mode=mode, top_n=top_n, log_scale=log_scale,
-                                    source="ths", title_extra=title_extra)
+            ths_fig = self.generate(ths_df, mode=mode, top_n=top_n, bottom_n=bottom_n,
+                                    log_scale=log_scale, source="ths", title_extra=title_extra)
             ths_chart = ths_fig.to_html(include_plotlyjs=False, full_html=False,
                                         div_id="chart-ths", config=plot_config)
 
@@ -708,7 +775,8 @@ def main():
                         help=f"采集间隔秒数 (默认 {COLLECT_INTERVAL})")
     parser.add_argument("--keep-days", type=int, default=30,
                         help="数据保留天数 (默认 30)")
-    parser.add_argument("--top", type=int, default=TOP_N, help=f"显示板块数 (默认 {TOP_N})")
+    parser.add_argument("--top", type=int, default=TOP_N, help=f"显示净流入板块数 (默认 {TOP_N})")
+    parser.add_argument("--bottom", type=int, default=BOTTOM_N, help=f"显示净流出板块数 (默认 {BOTTOM_N})")
     parser.add_argument("--mode", choices=["delta", "cumulative"], default="cumulative",
                         help="显示模式: cumulative=累计 (默认), delta=增量")
     parser.add_argument("--log", action="store_true", help="Y 轴使用对数坐标")
@@ -736,9 +804,11 @@ def main():
         ths_df = _load_today_data(chart, source="ths") if ths_collector else None
 
         if em_df is not None and ths_df is not None:
-            chart.show_dual(em_df, ths_df, mode=args.mode, top_n=args.top, log_scale=args.log)
+            chart.show_dual(em_df, ths_df, mode=args.mode, top_n=args.top,
+                            bottom_n=args.bottom, log_scale=args.log)
         elif em_df is not None:
-            chart.show(em_df, mode=args.mode, top_n=args.top, log_scale=args.log)
+            chart.show(em_df, mode=args.mode, top_n=args.top,
+                       bottom_n=args.bottom, log_scale=args.log)
         else:
             print("无数据可显示")
         return
@@ -764,9 +834,11 @@ def main():
             em_df = chart.load_data(data_path, source="em") if not args.csv else chart.load_data(data_path)
             ths_df = _load_today_data(chart, source="ths") if not args.csv else None
             if ths_df is not None:
-                chart.show_dual(em_df, ths_df, mode=args.mode, top_n=args.top, log_scale=args.log)
+                chart.show_dual(em_df, ths_df, mode=args.mode, top_n=args.top,
+                                bottom_n=args.bottom, log_scale=args.log)
             else:
-                chart.show(em_df, mode=args.mode, top_n=args.top, log_scale=args.log)
+                chart.show(em_df, mode=args.mode, top_n=args.top,
+                           bottom_n=args.bottom, log_scale=args.log)
         except FileNotFoundError as e:
             print(e)
             sys.exit(1)
@@ -780,7 +852,7 @@ def main():
 
     print("=" * 60)
     print("  资金流向实时走势图（东方财富 + 同花顺）")
-    print(f"  累计模式 · 前 {args.top} 板块 · {args.interval}s 采集")
+    print(f"  累计模式 · 净流入前 {args.top} + 净流出前 {args.bottom} · {args.interval}s 采集")
     print(f"  图表服务: http://localhost:{args.port}")
     print("  Ctrl+C 停止")
     print("=" * 60)
@@ -796,7 +868,8 @@ def main():
         if em_df is None and ths_df is None:
             raise FileNotFoundError("暂无数据")
         return chart._build_dual_html(em_df, ths_df, mode=args.mode, top_n=args.top,
-                                       log_scale=args.log, refresh_seconds=args.interval,
+                                       bottom_n=args.bottom, log_scale=args.log,
+                                       refresh_seconds=args.interval,
                                        title_extra=title_extra)
 
     try:
