@@ -193,6 +193,12 @@ function setDot(source, status) {
     if (dot) { dot.className = 'status-dot ' + status; }
 }
 
+function showNoData(source, label) {
+    var el = document.getElementById('chart-' + source);
+    if (el) { el.innerHTML = '<div class="loading-msg">暂无' + label + '数据</div>'; }
+    setDot(source, 'error');
+}
+
 function buildTraces(sectors, markerSize) {
     return sectors.map(function(s) {
         var cfg = {
@@ -302,9 +308,9 @@ async function fetchData() {
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         var json = await resp.json();
         if (json.em) renderChart('em', json.em);
-        else setDot('em', 'error');
+        else showNoData('em', '东方财富');
         if (json.ths) renderChart('ths', json.ths);
-        else setDot('ths', 'error');
+        else showNoData('ths', '同花顺');
     } catch (e) {
         console.error('Fetch error:', e);
         setDot('em', 'error');
