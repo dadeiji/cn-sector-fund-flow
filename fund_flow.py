@@ -349,6 +349,16 @@ OUTFLOW_COLORS = [
     "#546e7a", "#78909c", "#90a4ae", "#b0bec5", "#455a64",
 ]
 
+# 过滤掉非行业/概念板块（市场机制类），东方财富和同花顺共用
+SECTOR_BLACKLIST = {
+    "融资融券", "融资", "融券",
+    "深股通", "沪股通", "北向资金", "南向资金",
+    "中证500", "中证1000", "沪深300", "上证50",
+    "创业板指", "科创50", "MSCI", "富时罗素",
+    "标普道琼斯中国", "央行票据", "国债逆回购",
+    "证金持股", "同花顺中特估100",
+}
+
 
 def is_trading_day() -> bool:
     return datetime.now().weekday() < 5
@@ -429,21 +439,12 @@ class FundFlowCollector:
         data = r.json()
         return data.get("data", {}).get("diff", [])
 
-    # 过滤掉非行业/概念板块（市场机制类）
-    SECTOR_BLACKLIST = {
-        "融资融券", "融资", "融券",
-        "深股通", "沪股通", "北向资金", "南向资金",
-        "中证500", "中证1000", "沪深300", "上证50",
-        "创业板指", "科创50", "MSCI", "富时罗素",
-        "标普道琼斯中国", "央行票据", "国债逆回购",
-    }
-
     def _parse(self, raw: list[dict]) -> list[dict]:
         now = datetime.now()
         rows = []
         for item in raw:
             name = item.get("f14", "")
-            if name in self.SECTOR_BLACKLIST:
+            if name in SECTOR_BLACKLIST:
                 continue
             main_net = (item.get("f62") or 0) / 1e8  # 转为亿
             prev = self._prev_flow.get(name)
@@ -581,6 +582,8 @@ class THSFundFlowCollector:
         rows = []
         for item in raw:
             name = item.get("name", "")
+            if name in SECTOR_BLACKLIST:
+                continue
             amount = item.get("amount", 0)  # 已经是亿
             prev = self._prev_flow.get(name)
             delta = amount - prev if prev is not None else None
