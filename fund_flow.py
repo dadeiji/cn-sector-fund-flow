@@ -111,6 +111,214 @@ function switchTab(tab) {{
 </body>
 </html>"""
 
+# AJAX 动态模板：JS 轮询 /api/data，Plotly.react 增量更新
+AJAX_TEMPLATE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", "PingFang SC", sans-serif; background: #f5f5f5; }
+.tab-bar {
+    display: flex; align-items: center; gap: 0;
+    background: #fff; border-bottom: 2px solid #e0e0e0;
+    padding: 0 16px; height: 44px; flex-shrink: 0;
+}
+.tab-btn {
+    padding: 8px 24px; font-size: 14px; font-weight: 600;
+    border: none; background: none; cursor: pointer;
+    color: #888; border-bottom: 3px solid transparent;
+    transition: all 0.2s; margin-bottom: -2px;
+}
+.tab-btn:hover { color: #333; }
+.tab-btn.active { color: #1a73e8; border-bottom-color: #1a73e8; }
+.tab-badge { font-size: 11px; color: #999; margin-left: 4px; font-weight: 400; }
+.status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    display: inline-block; margin-left: 8px; vertical-align: middle;
+}
+.status-dot.ok { background: #2ecc71; }
+.status-dot.loading { background: #f39c12; animation: pulse 1s infinite; }
+.status-dot.error { background: #e74c3c; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+.tab-panel { display: none; width: 100%; height: calc(100vh - 44px); }
+.tab-panel.active { display: block; }
+.page-wrap { display: flex; flex-direction: column; height: 100vh; }
+.chart-box { width: 100%; height: 100%; }
+.loading-msg {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: #999; font-size: 14px;
+}
+</style>
+<script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
+</head>
+<body>
+<div class="page-wrap">
+  <div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('em')">
+      东方财富<span class="tab-badge">主力净流入</span>
+      <span class="status-dot loading" id="dot-em"></span>
+    </button>
+    <button class="tab-btn" onclick="switchTab('ths')">
+      同花顺<span class="tab-badge">资金净额</span>
+      <span class="status-dot loading" id="dot-ths"></span>
+    </button>
+  </div>
+  <div id="panel-em" class="tab-panel active"><div id="chart-em" class="chart-box"><div class="loading-msg">加载中...</div></div></div>
+  <div id="panel-ths" class="tab-panel"><div id="chart-ths" class="chart-box"><div class="loading-msg">加载中...</div></div></div>
+</div>
+<script>
+const POLL_INTERVAL = __POLL_MS__;
+const COLORS = __COLORS_JSON__;
+const OUTFLOW_COLORS = __OUTFLOW_JSON__;
+let activeTab = 'em';
+let charts = { em: null, ths: null };
+
+function switchTab(tab) {
+    activeTab = tab;
+    document.querySelectorAll('.tab-btn').forEach(function(btn, i) {
+        btn.classList.toggle('active', (tab === 'em' && i === 0) || (tab === 'ths' && i === 1));
+    });
+    document.getElementById('panel-em').classList.toggle('active', tab === 'em');
+    document.getElementById('panel-ths').classList.toggle('active', tab === 'ths');
+    var panel = document.getElementById('panel-' + tab);
+    var gd = panel.querySelector('.js-plotly-plot');
+    if (gd) { Plotly.Plots.resize(gd); }
+}
+
+function setDot(source, status) {
+    var dot = document.getElementById('dot-' + source);
+    if (dot) { dot.className = 'status-dot ' + status; }
+}
+
+function buildTraces(sectors, markerSize) {
+    return sectors.map(function(s) {
+        var cfg = {
+            x: s.times,
+            y: s.values,
+            mode: 'lines+markers',
+            name: s.name,
+            line: { color: s.color, width: 2 },
+            marker: { color: s.color, size: markerSize },
+            hovertemplate: '<b>' + s.name + '</b><br>时间: %{x|%H:%M:%S}<br>' + s.y_label + ': %{y:.2f}亿<extra></extra>',
+            hoverlabel: { namelength: -1, font_size: 13 }
+        };
+        if (s.is_outflow) {
+            cfg.marker.symbol = 'diamond';
+        }
+        return cfg;
+    });
+}
+
+function buildAnnotations(sectors, y_label) {
+    var annots = [];
+    sectors.forEach(function(s) {
+        var lastVal = s.values[s.values.length - 1];
+        var valStr = (lastVal >= 0 ? '+' : '') + lastVal.toFixed(2);
+        if (Math.abs(lastVal) < 1) { valStr = (lastVal >= 0 ? '+' : '') + lastVal.toFixed(4); }
+        annots.push({
+            x: 1.01, y: lastVal,
+            xref: 'paper', yref: 'y',
+            text: '<b>' + s.name + '</b> ' + valStr,
+            showarrow: false,
+            xanchor: 'left', yanchor: 'middle',
+            font: { color: s.color, size: s.is_outflow ? 11 : 12, family: 'Microsoft YaHei, SimHei, sans-serif' },
+            bgcolor: 'rgba(255,255,255,0.95)',
+            bordercolor: s.color,
+            borderwidth: 1.5,
+            borderpad: 3
+        });
+    });
+    return annots;
+}
+
+function buildLayout(data, divId) {
+    return {
+        title: {
+            text: '<b>' + data.source_label + ' · 概念板块主力资金流向走势图 ' + data.title_suffix + '</b>',
+            font: { size: 16, color: '#333' },
+            x: 0.01, y: 0.98, xanchor: 'left', yanchor: 'top'
+        },
+        xaxis: {
+            title: '', type: 'date', tickformat: '%H:%M',
+            showgrid: false, zeroline: false,
+            range: data.x_range,
+            rangebreaks: [{ bounds: [11.5, 13], pattern: 'hour' }],
+            tickfont: { size: 11, color: '#666' }
+        },
+        yaxis: {
+            title: { text: data.y_label, font: { size: 12, color: '#666' } },
+            type: data.log_scale ? 'log' : 'linear',
+            showgrid: true, gridcolor: '#f0f0f0',
+            zeroline: true, zerolinecolor: '#ccc', zerolinewidth: 1,
+            tickfont: { size: 11, color: '#666' }
+        },
+        plot_bgcolor: '#fafafa',
+        paper_bgcolor: 'white',
+        hovermode: 'x unified',
+        legend: {
+            orientation: 'h', yanchor: 'top', y: 0.99, xanchor: 'left', x: 0.01,
+            font: { size: 10 }, bgcolor: 'rgba(255,255,255,0.8)',
+            bordercolor: '#ddd', borderwidth: 1
+        },
+        margin: { l: 60, r: 220, t: 80, b: 40 },
+        annotations: buildAnnotations(data.sectors, data.y_label).concat([{
+            x: 0.995, y: 0.01, xref: 'paper', yref: 'paper',
+            text: '更新于 ' + data.updated_at,
+            showarrow: false, font: { size: 10, color: '#999' }
+        }])
+    };
+}
+
+function renderChart(source, data) {
+    var divId = 'chart-' + source;
+    var el = document.getElementById(divId);
+    if (!data || !data.sectors || data.sectors.length === 0) {
+        el.innerHTML = '<div class="loading-msg">暂无' + (data ? data.source_label : '') + '数据</div>';
+        setDot(source, 'error');
+        return;
+    }
+    var timePoints = data.time_points || 10;
+    var markerSize = timePoints <= 3 ? 6 : 3;
+    var traces = buildTraces(data.sectors, markerSize);
+    var layout = buildLayout(data, divId);
+    var config = { responsive: true, displayModeBar: true };
+
+    if (charts[source]) {
+        Plotly.react(divId, traces, layout, config);
+    } else {
+        el.innerHTML = '';
+        Plotly.newPlot(divId, traces, layout, config);
+        charts[source] = true;
+    }
+    setDot(source, 'ok');
+}
+
+async function fetchData() {
+    try {
+        var resp = await fetch('/api/data');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        var json = await resp.json();
+        if (json.em) renderChart('em', json.em);
+        else setDot('em', 'error');
+        if (json.ths) renderChart('ths', json.ths);
+        else setDot('ths', 'error');
+    } catch (e) {
+        console.error('Fetch error:', e);
+        setDot('em', 'error');
+        setDot('ths', 'error');
+    }
+}
+
+// 启动轮询
+fetchData();
+setInterval(fetchData, POLL_INTERVAL);
+</script>
+</body>
+</html>"""
+
 
 def _wrap_html(plot_html: str, refresh_seconds: int = None) -> str:
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
@@ -645,6 +853,81 @@ class FundFlowChart:
             print(f"图表已保存: {output}")
         return fig
 
+    def generate_json(self, df: pd.DataFrame, mode: str = "delta",
+                      top_n: int = TOP_N, bottom_n: int = BOTTOM_N,
+                      log_scale: bool = False, title_extra: str = "",
+                      source: str = "em") -> dict:
+        """生成图表数据的 JSON 表示，供前端 JS 动态渲染。"""
+
+        source_label = "同花顺" if source == "ths" else "东方财富"
+        value_col = "delta" if mode == "delta" else "main_net_inflow"
+        y_label = "增量净流入（亿）" if mode == "delta" else "累计净流入（亿）"
+        title_suffix = "· 增量" if mode == "delta" else "· 累计"
+        if log_scale:
+            title_suffix += " (对数)"
+        if title_extra:
+            title_suffix += f" · {title_extra}"
+
+        last_tick = df["time"].max()
+        min_records = df["time"].nunique() * 0.5
+        sector_counts = df.groupby("sector").size()
+        valid_sectors = sector_counts[sector_counts >= min_records].index
+
+        last_slice = df[(df["time"] == last_tick) & (df["sector"].isin(valid_sectors))]
+        ranking = last_slice.groupby("sector")["main_net_inflow"].last().sort_values(ascending=False)
+
+        top_sectors = ranking.head(top_n).index.tolist()
+        bottom_sectors = ranking.tail(bottom_n).index.tolist() if bottom_n > 0 else []
+        bottom_sectors = [s for s in bottom_sectors if s not in top_sectors]
+        all_sectors = top_sectors + bottom_sectors
+
+        df_top = df[df["sector"].isin(all_sectors)]
+        time_points = df["time"].nunique()
+
+        x_range_start = df_top["time"].iloc[0].replace(
+            hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute, second=0
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        x_range_end = df_top["time"].iloc[0].replace(
+            hour=MARKET_CLOSE.hour, minute=MARKET_CLOSE.minute, second=0
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+        sectors_data = []
+
+        # 净流入板块
+        for i, sector in enumerate(top_sectors):
+            sub = df_top[df_top["sector"] == sector].sort_values("time")
+            sectors_data.append({
+                "name": sector,
+                "times": sub["time"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist(),
+                "values": sub[value_col].round(4).tolist(),
+                "color": COLORS[i % len(COLORS)],
+                "is_outflow": False,
+                "y_label": y_label,
+            })
+
+        # 净流出板块
+        for i, sector in enumerate(bottom_sectors):
+            sub = df_top[df_top["sector"] == sector].sort_values("time")
+            sectors_data.append({
+                "name": sector,
+                "times": sub["time"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist(),
+                "values": sub[value_col].round(4).tolist(),
+                "color": OUTFLOW_COLORS[i % len(OUTFLOW_COLORS)],
+                "is_outflow": True,
+                "y_label": y_label,
+            })
+
+        return {
+            "source_label": source_label,
+            "y_label": y_label,
+            "title_suffix": title_suffix,
+            "log_scale": log_scale,
+            "time_points": time_points,
+            "x_range": [x_range_start, x_range_end],
+            "updated_at": datetime.now().strftime("%H:%M:%S"),
+            "sectors": sectors_data,
+        }
+
     def show(self, df: pd.DataFrame, mode: str = "delta", top_n: int = TOP_N,
              bottom_n: int = BOTTOM_N, log_scale: bool = False):
         CHART_DIR.mkdir(parents=True, exist_ok=True)
@@ -692,23 +975,37 @@ class FundFlowChart:
 
 
 class _ChartHandler(http.server.SimpleHTTPRequestHandler):
-    html_gen = None
+    data_gen = None       # 返回 dict 的回调
+    ajax_html = ""        # AJAX 模板 HTML
     refresh_seconds = 60
-    _cache = {"html": None, "data_mtime": 0}
+    _cache = {"json": None, "data_mtime": 0}
     _cache_lock = threading.Lock()
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
+            # 返回 AJAX 模板（静态 HTML，数据由 JS 轮询获取）
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(self.ajax_html.encode("utf-8"))
+
+        elif self.path == "/api/data":
             try:
-                html = self._get_cached_html()
+                data = self._get_cached_data()
+                body = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
                 self.send_response(200)
-                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.send_header("Content-type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(html.encode("utf-8"))
+                self.wfile.write(body)
             except Exception as e:
                 self.send_response(500)
+                self.send_header("Content-type", "application/json; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(f"生成图表失败: {e}".encode())
+                self.wfile.write(json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+
         elif self.path == "/api/health":
             self.send_response(200)
             self.send_header("Content-type", "application/json")
@@ -717,7 +1014,7 @@ class _ChartHandler(http.server.SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
-    def _get_cached_html(self):
+    def _get_cached_data(self):
         today = datetime.now().strftime("%Y%m%d")
         em_fp = DATA_DIR / DATA_FILENAME.format(date=today)
         ths_fp = DATA_DIR / THS_DATA_FILENAME.format(date=today)
@@ -728,25 +1025,40 @@ class _ChartHandler(http.server.SimpleHTTPRequestHandler):
         if mtime == 0:
             raise FileNotFoundError("暂无数据")
         with self._cache_lock:
-            if self._cache["html"] and self._cache["data_mtime"] == mtime:
-                return self._cache["html"]
-        html = self.html_gen()
+            if self._cache["json"] and self._cache["data_mtime"] == mtime:
+                return self._cache["json"]
+        data = self.data_gen()
         with self._cache_lock:
-            self._cache["html"] = html
+            self._cache["json"] = data
             self._cache["data_mtime"] = mtime
-        return html
+        return data
 
     def log_message(self, format, *args):
         pass  # 静默日志，减少干扰
 
 
-def _make_handler(html_gen, refresh_seconds=60):
-    cls = type("Handler", (_ChartHandler,), {"html_gen": staticmethod(html_gen), "refresh_seconds": refresh_seconds})
+def _make_handler(data_gen, ajax_html, refresh_seconds=60):
+    cls = type("Handler", (_ChartHandler,), {
+        "data_gen": staticmethod(data_gen),
+        "ajax_html": ajax_html,
+        "refresh_seconds": refresh_seconds,
+    })
     return cls
 
 
-def _start_http_server(html_gen, port: int = HTTP_PORT, refresh_seconds: int = 60):
-    handler = _make_handler(html_gen, refresh_seconds)
+def _build_ajax_html(refresh_seconds: int = 60) -> str:
+    """生成 AJAX 模板 HTML，注入配置参数。"""
+    return (
+        AJAX_TEMPLATE
+        .replace("__POLL_MS__", str(refresh_seconds * 1000))
+        .replace("__COLORS_JSON__", json.dumps(COLORS))
+        .replace("__OUTFLOW_JSON__", json.dumps(OUTFLOW_COLORS))
+    )
+
+
+def _start_http_server(data_gen, port: int = HTTP_PORT, refresh_seconds: int = 60):
+    ajax_html = _build_ajax_html(refresh_seconds)
+    handler = _make_handler(data_gen, ajax_html, refresh_seconds)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     socketserver.ThreadingTCPServer.daemon_threads = True
     with socketserver.ThreadingTCPServer(("", port), handler) as httpd:
@@ -857,7 +1169,7 @@ def main():
     print("  Ctrl+C 停止")
     print("=" * 60)
 
-    def gen_html():
+    def gen_data():
         session = market_session()
         title_extra = {
             "lunch": "上午半场总结",
@@ -867,13 +1179,19 @@ def main():
         ths_df = _load_today_data(chart, source="ths") if ths_collector else None
         if em_df is None and ths_df is None:
             raise FileNotFoundError("暂无数据")
-        return chart._build_dual_html(em_df, ths_df, mode=args.mode, top_n=args.top,
-                                       bottom_n=args.bottom, log_scale=args.log,
-                                       refresh_seconds=args.interval,
-                                       title_extra=title_extra)
+        result = {}
+        if em_df is not None:
+            result["em"] = chart.generate_json(em_df, mode=args.mode, top_n=args.top,
+                                               bottom_n=args.bottom, log_scale=args.log,
+                                               title_extra=title_extra, source="em")
+        if ths_df is not None:
+            result["ths"] = chart.generate_json(ths_df, mode=args.mode, top_n=args.top,
+                                                bottom_n=args.bottom, log_scale=args.log,
+                                                title_extra=title_extra, source="ths")
+        return result
 
     try:
-        _start_http_server(gen_html, port=args.port, refresh_seconds=args.interval)
+        _start_http_server(gen_data, port=args.port, refresh_seconds=args.interval)
     except KeyboardInterrupt:
         collector.stop()
         if ths_collector:
