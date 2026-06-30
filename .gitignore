@@ -48,3 +48,6 @@ agent.json
 # Runtime data files
 data/*.json
 fund_flow.py.bak
+
+# 生成的图表文件（由 fund_flow.py 运行时生成）
+charts/
