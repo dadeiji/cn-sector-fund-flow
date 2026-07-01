@@ -12,6 +12,7 @@
 import argparse
 import http.server
 import json
+import re
 import socketserver
 import sys
 import threading
@@ -414,15 +415,68 @@ OUTFLOW_COLORS = [
     "#546e7a", "#78909c", "#90a4ae", "#b0bec5", "#455a64",
 ]
 
-# 过滤掉非行业/概念板块（市场机制类），东方财富和同花顺共用
+# 过滤掉非行业/概念板块（市场机制/指数/风格/状态类），东方财富和同花顺共用
 SECTOR_BLACKLIST = {
-    "融资融券", "融资", "融券",
-    "深股通", "沪股通", "北向资金", "南向资金",
-    "中证500", "中证1000", "沪深300", "上证50",
-    "创业板指", "科创50", "MSCI", "富时罗素",
-    "标普道琼斯中国", "央行票据", "国债逆回购",
-    "证金持股", "同花顺中特估100",
+    # 市场机制
+    "融资融券", "融资", "融券", "深股通", "沪股通", "北向资金", "南向资金",
+    "央行票据", "国债逆回购", "证金持股",
+    # 指数（沪深港/国际/编制类）
+    "中证500", "中证1000", "沪深300", "HS300_", "上证50", "上证50_", "上证180_", "上证380",
+    "央视50_", "深成500", "深证100R", "创业成份", "创业板综", "创业板指", "科创50",
+    "MSCI", "MSCI中国", "富时罗素", "标普道琼斯中国", "标准普尔",
+    "宁组合", "茅指数",
+    "同花顺中特估100", "同花顺出海50", "同花顺新质50", "同花顺果指数", "同花顺漂亮100",
+    # 风格/市值因子
+    "先进制造风格", "医药医疗风格", "科技风格", "消费风格", "金融地产风格",
+    "大盘价值", "大盘成长", "大盘股", "中盘价值", "中盘成长", "中盘股",
+    "小盘价值", "小盘成长", "小盘股", "价值股", "周期股", "趋势股", "题材股",
+    "反转股", "超跌股", "微利股", "红利股", "红利破净股", "长期破净",
+    # 市场状态/股性
+    "ST股", "百元股", "破净股", "破发股", "破增发价股", "次新股",
+    "昨日涨停", "昨日涨停_含一字", "昨日炸板", "昨日触板", "昨日连板",
+    "昨日连板_含一字", "昨日首板", "昨日高振幅", "昨日高换手", "昨日打二板以上表现",
+    "最近多板", "近期新高", "百日新高", "历史新高",
+    "举牌", "机构重仓", "基金重仓", "社保重仓", "QFII重仓", "权重股",
+    "行业龙头", "独角兽", "东方财富热股",
+    "转债标的", "科创板做市商", "科创板做市股", "IPO受益",
+    "股权激励", "股权转让", "并购重组概念",
+    # 参股类
+    "参股保险", "参股券商", "参股新三板", "参股期货", "参股银行",
+    # 股票类型
+    "AB股", "AH股", "B股",
+    # 改革/区域/持股主题（用户指定删除）
+    "国家大基金持股", "央国企改革", "央企国企改革", "国企改革", "沪企改革",
+    "海峡两岸", "粤港澳大湾区",
 }
+
+# 带年份等动态命名的板块用正则匹配（如 2025三季报预增）
+SECTOR_BLACKLIST_PATTERNS = [
+    re.compile(r"^20\d{2}(年报|半年报|中报|一季报|三季报|季报)"),
+]
+
+
+def is_blacklisted(name: str) -> bool:
+    """判断板块名是否在黑名单（精确匹配或正则匹配）。"""
+    if name in SECTOR_BLACKLIST:
+        return True
+    return any(p.search(name) for p in SECTOR_BLACKLIST_PATTERNS)
+
+
+def _read_jsonl(fp: Path) -> pd.DataFrame:
+    """逐行读取 JSONL，跳过损坏行（兼容采集中断留下的半行/null字节）。"""
+    rows = []
+    with open(fp, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except (json.JSONDecodeError, ValueError):
+                continue
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 
 def is_trading_day() -> bool:
@@ -509,7 +563,7 @@ class FundFlowCollector:
         rows = []
         for item in raw:
             name = item.get("f14", "")
-            if name in SECTOR_BLACKLIST:
+            if is_blacklisted(name):
                 continue
             main_net = (item.get("f62") or 0) / 1e8  # 转为亿
             prev = self._prev_flow.get(name)
@@ -647,7 +701,7 @@ class THSFundFlowCollector:
         rows = []
         for item in raw:
             name = item.get("name", "")
-            if name in SECTOR_BLACKLIST:
+            if is_blacklisted(name):
                 continue
             amount = item.get("amount", 0)  # 已经是亿
             prev = self._prev_flow.get(name)
@@ -737,7 +791,7 @@ class FundFlowChart:
             fp = DATA_DIR / name_tmpl.format(date=date)
             if not fp.exists():
                 raise FileNotFoundError(f"数据文件不存在: {fp}")
-            df = pd.read_json(fp, lines=True)
+            df = _read_jsonl(fp)
         else:
             default_fp = DATA_DIR / name_tmpl.format(date=today)
             fp = data_path or default_fp
@@ -745,16 +799,20 @@ class FundFlowChart:
                 today_files = sorted(fp.parent.glob(pattern))
                 if not today_files:
                     raise FileNotFoundError(f"数据文件不存在: {fp}")
-                dfs = [pd.read_json(f, lines=True) for f in today_files]
+                dfs = [_read_jsonl(f) for f in today_files]
                 df = pd.concat(dfs, ignore_index=True)
             else:
-                df = pd.read_json(fp, lines=True)
+                df = _read_jsonl(fp)
         df["time"] = pd.to_datetime(df["time"], format="%H:%M:%S")
         # 允许收盘后采集的数据（取 15:00 和实际最大时间的较大值）
         close_time = df["time"].iloc[0].replace(hour=MARKET_CLOSE.hour, minute=MARKET_CLOSE.minute, second=0)
         max_time = df["time"].max()
         cutoff = max(close_time, max_time)
         df = df[df["time"] <= cutoff]
+        # 显示层也过滤黑名单板块（兼容修复前采集的旧数据）
+        blacklisted = {s for s in df["sector"].unique() if is_blacklisted(s)}
+        if blacklisted:
+            df = df[~df["sector"].isin(blacklisted)]
         return df
 
     def available_dates(self, source: str = "em") -> list[str]:
